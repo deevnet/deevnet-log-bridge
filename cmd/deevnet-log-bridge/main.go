@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -89,6 +90,16 @@ func main() {
 	time.Sleep(time.Second)
 }
 
+// subackFailure is what a broker answers for a filter it will not grant.
+// MQTT 3.1.1 §3.9.3: the return code 0x80 means failure, and it arrives in an
+// otherwise successful SUBACK.
+const subackFailure = 0x80
+
+// subscribed is what /healthz reports. A bridge that is running but not
+// subscribed is not doing its job, and the one thing this process must never
+// do is look fine while carrying nothing.
+var subscribed atomic.Bool
+
 func connect(cfg config, queue *bridge.Queue, log *slog.Logger) (mqtt.Client, error) {
 	opts := mqtt.NewClientOptions().
 		AddBroker(cfg.brokerURL).
@@ -134,12 +145,32 @@ func connect(cfg config, queue *bridge.Queue, log *slog.Logger) (mqtt.Client, er
 			queue.Add(line)
 		})
 		if tok.Wait() && tok.Error() != nil {
+			subscribed.Store(false)
 			log.Error("subscribing", "topic", cfg.topic, "err", tok.Error())
 			return
 		}
+		// A SUBACK is not an acceptance. A broker that refuses a filter on
+		// ACL grounds answers 0x80 for it and leaves the connection up, and
+		// the client library does not call that an error - so without this
+		// the bridge would report itself subscribed, carry nothing, and look
+		// healthy while doing it. Found by running this against an account
+		// whose ACL did not cover the filter.
+		if st, ok := tok.(*mqtt.SubscribeToken); ok {
+			for filter, qos := range st.Result() {
+				if qos == subackFailure {
+					subscribed.Store(false)
+					log.Error("the broker refused the subscription",
+						"topic", filter,
+						"hint", "the account's ACL does not cover this filter")
+					return
+				}
+			}
+		}
+		subscribed.Store(true)
 		log.Info("subscribed", "topic", cfg.topic)
 	})
 	opts.SetConnectionLostHandler(func(_ mqtt.Client, err error) {
+		subscribed.Store(false)
 		log.Warn("lost the broker", "err", err)
 	})
 
@@ -150,12 +181,21 @@ func connect(cfg config, queue *bridge.Queue, log *slog.Logger) (mqtt.Client, er
 	return c, nil
 }
 
-// serveHealth answers on loopback only. It says this process is alive, not
-// that the broker or the store are: a bridge that cannot reach either is still
-// the right process to leave running, because both come back.
+// serveHealth answers on loopback only.
+//
+// It reports one thing: whether this bridge holds the subscription it exists
+// for. It does NOT report whether the store is reachable - that comes back by
+// itself, and a bridge that cannot write for a minute is still the right
+// process to leave running. A refused subscription is different: it does not
+// come back by itself, because it means the account may not hold this filter.
 func serveHealth(ctx context.Context, addr string, log *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if !subscribed.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintln(w, "not subscribed")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
